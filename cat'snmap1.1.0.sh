@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# cat's nmap — cat'snmap1.1.1.sh
+# cat's nmap — catsnmap1.1.2.sh
 # A port scanner in shell. Connect scans, UDP, banner/version detection,
 # host discovery, CIDR and range expansion, nmap-style output.
 # No raw sockets, so -sS falls back to connect. bash 4.4+ and perl.
+# IPv4 only — IPv6 targets are not supported.
 #
-#   ./catsnmap1.1.1.sh 10.0.0.1
-#   ./catsnmap1.1.1.sh -p 22,80,443 -sV 10.0.0.0/24
-#   ./catsnmap1.1.1.sh --top-ports 100 -Pn example.com
+#   ./catsnmap1.1.2.sh 10.0.0.1
+#   ./catsnmap1.1.2.sh -p 22,80,443 -sV 10.0.0.0/24
+#   ./catsnmap1.1.2.sh --top-ports 100 -Pn example.com
 #
 # A.C Holdings / Team Flames
 
 set -uo pipefail
 export LC_ALL=C
 
-VER="1.1.1"
+VER="1.1.2"
 PROG="cat's nmap"
 SELF="${0##*/}"
 
@@ -38,7 +39,11 @@ VERBOSE=0
 TIMING=4
 TOP_PORTS=""
 MAX_PAR=64
+MAX_PAR_OPT=""
+MAX_PAR_GIVEN=0
 CONN_T=1
+CONN_T_OPT=""
+CONN_T_GIVEN=0
 MAX_RETRY=2
 OUT_N=""
 OUT_G=""
@@ -55,7 +60,7 @@ is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 usage() {
   cat <<EOF
-$PROG $VER — port scanner in shell
+$PROG $VER — port scanner in shell (IPv4)
 
 Usage: $SELF [options] <target ...>
 
@@ -70,8 +75,8 @@ Scan      -sT            TCP connect scan (default)
           --open         show only open ports
 
 Timing    -T0..-T5       paranoid .. insane (default -T4)
-          --max-par N    parallel workers
-          --timeout S    connect timeout seconds
+          --max-par N    parallel workers (overrides -T)
+          --timeout S    connect timeout seconds (overrides -T)
           --max-retries N  retries on a filtered port (default 2)
 
 Output    -oN file        normal text
@@ -104,8 +109,8 @@ while [ $# -gt 0 ]; do
     --open) SHOW_ALL=0 ;;
     -T[0-5]) TIMING="${1#-T}" ;;
     -T) shift; [ $# -gt 0 ] || die "option -T needs a level" 2; TIMING="$1" ;;
-    --max-par) shift; MAX_PAR="${1:-64}" ;;
-    --timeout) shift; CONN_T="${1:-1}" ;;
+    --max-par) shift; MAX_PAR_OPT="${1:-64}"; MAX_PAR_GIVEN=1 ;;
+    --timeout) shift; CONN_T_OPT="${1:-1}"; CONN_T_GIVEN=1 ;;
     --max-retries) shift; MAX_RETRY="${1:-2}" ;;
     -oN) shift; OUT_N="${1:-}" ;;
     -oG) shift; OUT_G="${1:-}" ;;
@@ -135,6 +140,10 @@ fi
 
 [ "${#TARGETS[@]}" -gt 0 ] || { usage; exit 2; }
 
+if [ "$PORTS_GIVEN" = 1 ] && [ -n "$TOP_PORTS" ]; then
+  die "-p and --top-ports are mutually exclusive" 2
+fi
+
 case "$TIMING" in
   0) CONN_T=8; MAX_PAR=1 ;;
   1) CONN_T=4; MAX_PAR=4 ;;
@@ -145,11 +154,28 @@ case "$TIMING" in
   *) TIMING=4; CONN_T=1; MAX_PAR=64 ;;
 esac
 
+# explicit --timeout / --max-par win over the -T preset
+[ "$MAX_PAR_GIVEN" = 1 ] && MAX_PAR="$MAX_PAR_OPT"
+[ "$CONN_T_GIVEN" = 1 ] && CONN_T="$CONN_T_OPT"
+
 is_num "$MAX_PAR" || MAX_PAR=64
 is_num "$CONN_T" || CONN_T=1
 is_num "$MAX_RETRY" || MAX_RETRY=2
 [ "$MAX_PAR" -lt 1 ] && MAX_PAR=1
 [ "$CONN_T" -lt 1 ] && CONN_T=1
+[ "$MAX_RETRY" -lt 0 ] 2>/dev/null && MAX_RETRY=0
+
+# validate output paths before the scan, not after
+check_out() {
+  local flag="$1" path="$2" d
+  [ -z "$path" ] && return 0
+  [ -d "$path" ] && die "$flag: output path is a directory: $path" 2
+  d=$(dirname -- "$path")
+  [ -d "$d" ] || die "$flag: no such directory: $d" 2
+}
+check_out -oN "$OUT_N"
+check_out -oG "$OUT_G"
+check_out -oX "$OUT_X"
 
 # ---------------------------------------------------------------- sockets ---
 if command -v timeout >/dev/null 2>&1; then
@@ -374,28 +400,24 @@ identify() {
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/catnmap.XXXXXX")" || die "mktemp failed"
 RES="$WORK/res"; : > "$RES"
 HOSTS="$WORK/hosts"; : > "$HOSTS"
-exec 8>>"$HOSTS"
-exec 9>>"$RES"
 
 HAS_FLOCK=0
 command -v flock >/dev/null 2>&1 && HAS_FLOCK=1
 
-lock()   { [ "$HAS_FLOCK" = 1 ] && flock -x "$1"; }
-unlock() { [ "$HAS_FLOCK" = 1 ] && flock -u "$1"; }
+# Each call opens its own descriptor for the lock target. A descriptor
+# inherited across fork() shares one open file description, so locking an
+# fd opened once in the parent would not exclude sibling workers.
+if [ "$HAS_FLOCK" = 1 ]; then
+  emit()      { { flock -x 9; printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >&9; } 9>>"$RES"; }
+  emit_host() { { flock -x 8; printf '%s\t%s\t%s\t%s\n' "$@" >&8; } 8>>"$HOSTS"; }
+else
+  emit()      { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >>"$RES"; }
+  emit_host() { printf '%s\t%s\t%s\t%s\n' "$@" >>"$HOSTS"; }
+fi
 
 trap 'INTERRUPTED=1; kill $(jobs -p) 2>/dev/null' INT
 trap 'rm -rf "$WORK"' EXIT
 
-emit() {
-  lock 9
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >&9
-  unlock 9
-}
-emit_host() {
-  lock 8
-  printf '%s\t%s\t%s\t%s\n' "$@" >&8
-  unlock 8
-}
 vlog() { [ "$VERBOSE" = 1 ] && printf '%s\n' "$1" >&2; return 0; }
 xml_esc() { printf '%s' "$1" | tr -d '\000\r\n' | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
 
@@ -497,8 +519,8 @@ wait
 [ "$INTERRUPTED" = 1 ] && printf 'interrupted — reporting partial results\n' >&2
 
 # ---------------------------------------------------------------- render ----
-sort -k1,1 -k2,2n "$RES" > "$WORK/res.sorted" 2>/dev/null
-sort -k1,1 "$HOSTS" > "$WORK/hosts.sorted" 2>/dev/null
+sort -t$'\t' -k1,1V -k2,2n "$RES" > "$WORK/res.sorted" 2>/dev/null
+sort -t$'\t' -k1,1V "$HOSTS" > "$WORK/hosts.sorted" 2>/dev/null
 
 render_host() {
   local ip="$1" name="$2" os="$3" state="$4" block nopen=0 closed

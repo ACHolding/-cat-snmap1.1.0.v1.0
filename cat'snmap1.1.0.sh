@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
-# cat's nmap — cat'snmap1.1.0.sh
+# cat's nmap — cat'snmap1.1.1.sh
 # A port scanner in shell. Connect scans, UDP, banner/version detection,
 # host discovery, CIDR and range expansion, nmap-style output.
-# No raw sockets, so -sS falls back to connect. bash 3.2+ and perl.
+# No raw sockets, so -sS falls back to connect. bash 4.4+ and perl.
 #
-#   ./cat'snmap1.1.0.sh 10.0.0.1
-#   ./cat'snmap1.1.0.sh -p 22,80,443 -sV 10.0.0.0/24
-#   ./cat'snmap1.1.0.sh --top-ports 100 -Pn example.com
+#   ./catsnmap1.1.1.sh 10.0.0.1
+#   ./catsnmap1.1.1.sh -p 22,80,443 -sV 10.0.0.0/24
+#   ./catsnmap1.1.1.sh --top-ports 100 -Pn example.com
 #
 # A.C Holdings / Team Flames
 
 set -uo pipefail
 export LC_ALL=C
 
-VER="1.1.0"
+VER="1.1.1"
 PROG="cat's nmap"
-SELF="cat'snmap1.1.0.sh"
+SELF="${0##*/}"
+
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] ||
+   { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 4 ]; }; then
+  printf '%s: bash 4.4 or newer required\n' "$PROG" >&2
+  exit 2
+fi
 
 # ---------------------------------------------------------------- state -----
 TARGETS=()
+PORTS=()
 PORTS_SPEC=""
+PORTS_GIVEN=0
 SCAN_TCP=1
 SCAN_UDP=0
 DO_VER=0
@@ -36,12 +44,14 @@ OUT_N=""
 OUT_G=""
 OUT_X=""
 INFILE=""
-DEGREES=0
+NO_DEGREES=0
 INTERRUPTED=0
 
 TOP100="7 9 13 21 22 23 25 26 37 53 79 80 81 88 106 110 111 113 119 135 139 143 144 179 199 389 427 443 444 445 465 513 514 515 543 544 548 554 587 631 646 873 990 993 995 1025 1026 1027 1028 1029 1110 1433 1720 1723 1755 1900 2000 2001 2049 2121 2717 3000 3128 3306 3389 3986 4899 5000 5009 5051 5060 5101 5190 5357 5432 5631 5666 5800 5900 6000 6001 6646 7070 8000 8008 8009 8080 8081 8443 8888 9100 9999 10000 32768 49152 49153 49154 49155 49156 49157"
 
-die() { printf '%s: %s\n' "$PROG" "$1" >&2; exit "${2:-1}"; }
+die()  { printf '%s: %s\n' "$PROG" "$1" >&2; exit "${2:-1}"; }
+warn() { printf '%s: %s\n' "$PROG" "$1" >&2; }
+is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 usage() {
   cat <<EOF
@@ -54,9 +64,9 @@ Targets   host, 10.0.0.0/24, 10.0.0.1-40, 10.0.0.1-10.0.0.40, comma lists, -iL f
 Scan      -sT            TCP connect scan (default)
           -sU            UDP scan
           -sn            ping sweep only, no ports
-          -sV            probe open ports for service/version
+          -sV            probe open ports for service/version (needs perl)
           -p <spec>      ports: 22,80,1-1024 ; -p- = all 65535
-          --top-ports N  scan the N most common ports
+          --top-ports N  scan the N most common ports (1-100)
           --open         show only open ports
 
 Timing    -T0..-T5       paranoid .. insane (default -T4)
@@ -85,13 +95,15 @@ while [ $# -gt 0 ]; do
     -sn|-sp) DO_PING=1; SCAN_TCP=0; SCAN_UDP=0 ;;
     -Pn|-PN) DO_PING=0 ;;
     -sV|-sv) DO_VER=1 ;;
-    -p) shift; PORTS_SPEC="${1:-}" ;;
-    -p*) PORTS_SPEC="${1#-p}" ;;
-    --top-ports) shift; TOP_PORTS="${1:-}" ;;
+    -p) shift; [ $# -gt 0 ] || die "option -p needs a port spec" 2
+        PORTS_SPEC="$1"; PORTS_GIVEN=1 ;;
+    -p*) PORTS_SPEC="${1#-p}"; PORTS_GIVEN=1 ;;
+    --top-ports) shift; [ $# -gt 0 ] || die "option --top-ports needs a number" 2
+                 TOP_PORTS="$1" ;;
     --top-ports=*) TOP_PORTS="${1#*=}" ;;
     --open) SHOW_ALL=0 ;;
     -T[0-5]) TIMING="${1#-T}" ;;
-    -T) shift; TIMING="${1:-4}" ;;
+    -T) shift; [ $# -gt 0 ] || die "option -T needs a level" 2; TIMING="$1" ;;
     --max-par) shift; MAX_PAR="${1:-64}" ;;
     --timeout) shift; CONN_T="${1:-1}" ;;
     --max-retries) shift; MAX_RETRY="${1:-2}" ;;
@@ -102,42 +114,62 @@ while [ $# -gt 0 ]; do
     -n) RESOLVE=0 ;;
     -R) RESOLVE=1 ;;
     -v|-vv) VERBOSE=1 ;;
-    --no-degrees) DEGREES=1 ;;
+    --no-degrees) NO_DEGREES=1 ;;
     -h|--help) usage; exit 0 ;;
     --version) printf '%s %s\n' "$PROG" "$VER"; exit 0 ;;
-    --) shift; while [ $# -gt 0 ]; do TARGETS+=("$1"); shift; done; break ;;
+    --) shift; while [ $# -gt 0 ]; do TARGETS+=("$1"); shift; done; continue ;;
     -*) die "unknown option: $1" 2 ;;
     *) TARGETS+=("$1") ;;
   esac
   shift
 done
 
-[ -n "$INFILE" ] && { [ -r "$INFILE" ] || die "cannot read $INFILE" 2; while IFS= read -r l; do
-  l="${l%%#*}"; l="$(printf '%s' "$l" | tr -d '[:space:]')"; [ -n "$l" ] && TARGETS+=("$l"); done < "$INFILE"; }
+if [ -n "$INFILE" ]; then
+  [ -r "$INFILE" ] || die "cannot read $INFILE" 2
+  while IFS= read -r l; do
+    l="${l%%#*}"
+    l="$(printf '%s' "$l" | tr -d '[:space:]')"
+    [ -n "$l" ] && TARGETS+=("$l")
+  done < "$INFILE"
+fi
 
 [ "${#TARGETS[@]}" -gt 0 ] || { usage; exit 2; }
 
 case "$TIMING" in
-  0) CONN_T=8; MAX_PAR=1 ;; 1) CONN_T=4; MAX_PAR=4 ;;
-  2) CONN_T=2; MAX_PAR=16 ;; 3) CONN_T=1; MAX_PAR=32 ;;
-  4) CONN_T=1; MAX_PAR=64 ;; 5) CONN_T=1; MAX_PAR=128 ;;
+  0) CONN_T=8; MAX_PAR=1 ;;
+  1) CONN_T=4; MAX_PAR=4 ;;
+  2) CONN_T=2; MAX_PAR=16 ;;
+  3) CONN_T=1; MAX_PAR=32 ;;
+  4) CONN_T=1; MAX_PAR=64 ;;
+  5) CONN_T=1; MAX_PAR=128 ;;
+  *) TIMING=4; CONN_T=1; MAX_PAR=64 ;;
 esac
+
+is_num "$MAX_PAR" || MAX_PAR=64
+is_num "$CONN_T" || CONN_T=1
+is_num "$MAX_RETRY" || MAX_RETRY=2
 [ "$MAX_PAR" -lt 1 ] && MAX_PAR=1
-[ "$MAX_RETRY" -lt 0 ] 2>/dev/null && MAX_RETRY=0
+[ "$CONN_T" -lt 1 ] && CONN_T=1
 
 # ---------------------------------------------------------------- sockets ---
-# tcp_state_once -> open | closed | filtered
 if command -v timeout >/dev/null 2>&1; then
-  tcp_state_once() {
-    timeout "$3" bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
-    case $? in 0) echo open ;; 124|137) echo filtered ;; *) echo closed ;; esac
-  }
+  TIMEOUT_BIN=timeout
 elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=gtimeout
+else
+  TIMEOUT_BIN=""
+fi
+
+HAVE_PERL=0
+command -v perl >/dev/null 2>&1 && HAVE_PERL=1
+
+# tcp_state_once -> open | closed | filtered
+if [ -n "$TIMEOUT_BIN" ]; then
   tcp_state_once() {
-    gtimeout "$3" bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+    "$TIMEOUT_BIN" "$3" bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
     case $? in 0) echo open ;; 124|137) echo filtered ;; *) echo closed ;; esac
   }
-elif command -v perl >/dev/null 2>&1; then
+elif [ "$HAVE_PERL" = 1 ]; then
   tcp_state_once() {
     perl -MIO::Socket::INET -e '
       $SIG{ALRM}=sub{exit 2}; alarm $ARGV[2];
@@ -146,6 +178,7 @@ elif command -v perl >/dev/null 2>&1; then
     case $? in 0) echo open ;; 2) echo filtered ;; *) echo closed ;;
   }
 else
+  warn "no timeout(1) or perl: connect timeouts are not enforced"
   tcp_state_once() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && echo open || echo closed; }
 fi
 
@@ -167,8 +200,10 @@ grab() {
     my ($a,$p,$t,$pr)=@ARGV;
     $SIG{ALRM}=sub{exit 3}; alarm $t;
     my $s=IO::Socket::INET->new(PeerAddr=>$a,PeerPort=>$p) or exit 1;
-    if ($pr ne ""){ print $s pack("H*", $pr); }
-    my $b=""; sysread($s,$b,2048); print $b;
+    print $s pack("H*", $pr) if $pr ne "";
+    my $b="";
+    for (1..2) { my $n=sysread($s,$b,2048,length $b); last unless $n; }
+    print $b;
   ' "$1" "$2" "$4" "$3" 2>/dev/null
 }
 
@@ -178,71 +213,104 @@ udp_grab() {
     my ($a,$p,$t,$pr)=@ARGV;
     $SIG{ALRM}=sub{exit 2}; alarm $t;
     my $s=IO::Socket::INET->new(PeerAddr=>$a,PeerPort=>$p,Proto=>"udp") or exit 1;
-    print $s pack("H*", $pr); my $b=""; sysread($s,$b,2048); print $b;
+    print $s pack("H*", $pr);
+    my $b=""; sysread($s,$b,2048); print $b;
   ' "$1" "$2" "$4" "$3" 2>/dev/null
 }
 
 # ---------------------------------------------------------------- targets ---
-ip2int() { local IFS=.; set -- $1; echo $(( ($1<<24)|($2<<16)|($3<<8)|$4 )); }
-int2ip() { echo "$(( ($1>>24)&255 )).$(( ($1>>16)&255 )).$(( ($1>>8)&255 )).$(( $1&255 ))"; }
+ip2int() {
+  local IFS=.
+  set -- $1
+  printf '%s' $(( ((10#${1:-0})<<24) | ((10#${2:-0})<<16) | ((10#${3:-0})<<8) | (10#${4:-0}) ))
+}
+int2ip() { printf '%s.%s.%s.%s' "$(( ($1>>24)&255 ))" "$(( ($1>>16)&255 ))" "$(( ($1>>8)&255 ))" "$(( $1&255 ))"; }
+
+is_ipv4() { case "$1" in ''|*[!0-9.]*) return 1 ;; esac; [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
 
 expand_one() {
-  local t="$1" base bits size start i host ips
+  local t="$1" base bits size start i pre lo hi a b ips
   case "$t" in
     */*)
       base="${t%/*}"; bits="${t#*/}"
       [ -z "$bits" ] && bits=32
-      { [ "$bits" -ge 0 ] && [ "$bits" -le 32 ]; } 2>/dev/null || { echo "bad cidr: $t" >&2; return; }
+      if ! is_num "$bits" || [ "$bits" -gt 32 ]; then warn "bad cidr: $t"; return 0; fi
+      is_ipv4 "$base" || { warn "bad cidr base: $t"; return 0; }
       start=$(( $(ip2int "$base") & (0xFFFFFFFF ^ ((1<<(32-bits))-1)) ))
       size=$(( 1 << (32-bits) ))
       for ((i=0;i<size;i++)); do int2ip $(( start+i )); done ;;
     *.*.*.*-*.*.*.*)
-      local a="${t%%-*}" b="${t##*-}"
-      for ((i=$(ip2int "$a");i<=$(ip2int "$b");i++)); do int2ip $i; done ;;
-    *-*)
-      local pre="${t%.*}" lo="${t##*.}"; lo="${lo%%-*}"; local hi="${t##*-}"
-      for ((i=lo;i<=hi;i++)); do echo "$pre.$i"; done ;;
+      a="${t%%-*}"; b="${t##*-}"
+      is_ipv4 "$a" && is_ipv4 "$b" || { warn "bad range: $t"; return 0; }
+      for ((i=$(ip2int "$a");i<=$(ip2int "$b");i++)); do int2ip "$i"; done ;;
+    *.*-*)
+      pre="${t%.*}"; lo="${t##*.}"; lo="${lo%%-*}"; hi="${t##*-}"
+      is_ipv4 "$pre" && is_num "$lo" && is_num "$hi" || { warn "bad range: $t"; return 0; }
+      for ((i=lo;i<=hi;i++)); do printf '%s.%s\n' "$pre" "$i"; done ;;
     *)
-      if [[ "$t" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$t"
-      else ips=$(getent hosts "$t" 2>/dev/null | awk '{print $1; exit}')
-           [ -z "$ips" ] && ips=$(host "$t" 2>/dev/null | awk '/has address/{print $4; exit}')
-           [ -z "$ips" ] && ips=$(dig +short A "$t" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
-           if [ -z "$ips" ]; then echo "unresolved: $t" >&2; else echo "$ips"; fi
+      if is_ipv4 "$t"; then
+        printf '%s\n' "$t"
+      else
+        ips=$(getent hosts "$t" 2>/dev/null | awk '{print $1; exit}')
+        [ -z "$ips" ] && ips=$(host "$t" 2>/dev/null | awk '/has address/{print $4; exit}')
+        [ -z "$ips" ] && ips=$(dig +short A "$t" 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+        if [ -z "$ips" ]; then warn "unresolved: $t"; else printf '%s\n' "$ips"; fi
       fi ;;
   esac
 }
 
 # ---------------------------------------------------------------- ports -----
-PORTS=()
-add_port() { [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] && PORTS+=("$1"); }
+add_port() {
+  is_num "$1" || return 0
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ] || return 0
+  PORTS+=("$1")
+}
 
 build_ports() {
-  local spec="$1" i a b
+  local spec="$1" tok a b i t
   [ "$spec" = "-" ] && spec="1-65535"
-  for spec in $(printf '%s' "$spec" | tr ',' ' '); do
-    case "$spec" in
-      *-*) a="${spec%%-*}"; b="${spec##*-}"
-           a="${a:-1}"; b="${b:-65535}"
-           [ "$a" -le "$b" ] || { local x=$a; a=$b; b=$x; }
-           for ((i=a;i<=b;i++)); do add_port $i; done ;;
-      *) add_port "$spec" ;;
+  for tok in $(printf '%s' "$spec" | tr ',' ' '); do
+    case "$tok" in
+      *-*)
+        a="${tok%%-*}"; b="${tok##*-}"
+        a="${a:-1}"; b="${b:-65535}"
+        if ! is_num "$a" || ! is_num "$b"; then warn "bad port range: $tok"; continue; fi
+        [ "$a" -le "$b" ] || { t=$a; a=$b; b=$t; }
+        [ "$a" -ge 1 ] || a=1
+        [ "$b" -le 65535 ] || b=65535
+        for ((i=a;i<=b;i++)); do add_port "$i"; done ;;
+      *) if is_num "$tok"; then add_port "$tok"; else warn "bad port: $tok"; fi ;;
     esac
   done
 }
 
 if [ -n "$TOP_PORTS" ]; then
+  is_num "$TOP_PORTS" || die "--top-ports needs a number" 2
+  [ "$TOP_PORTS" -ge 1 ] || TOP_PORTS=1
+  [ "$TOP_PORTS" -le 100 ] || TOP_PORTS=100
   n=0
   for p in $TOP100; do PORTS+=("$p"); n=$((n+1)); [ "$n" -ge "$TOP_PORTS" ] && break; done
-elif [ -n "$PORTS_SPEC" ]; then
+elif [ "$PORTS_GIVEN" = 1 ]; then
+  [ -n "$PORTS_SPEC" ] || die "-p needs a port spec" 2
   build_ports "$PORTS_SPEC"
 elif [ "$SCAN_TCP" = 1 ] || [ "$SCAN_UDP" = 1 ]; then
   build_ports "1-1024"
 fi
 
-if [ "${#PORTS[@]}" -gt 0 ]; then
-  PORTS=($(printf '%s\n' "${PORTS[@]}" | sort -n -u))
-fi
+[ "${#PORTS[@]}" -gt 0 ] && PORTS=($(printf '%s\n' "${PORTS[@]}" | sort -n -u))
 NPORTS=${#PORTS[@]}
+
+if { [ "$SCAN_TCP" = 1 ] || [ "$SCAN_UDP" = 1 ]; } && [ "$NPORTS" -eq 0 ]; then
+  die "no valid ports to scan" 2
+fi
+
+if [ "$DO_VER" = 1 ] && [ "$HAVE_PERL" = 0 ]; then
+  warn "perl not found: -sV disabled"
+  DO_VER=0
+fi
+if [ "$SCAN_UDP" = 1 ] && [ "$HAVE_PERL" = 0 ]; then
+  warn "perl not found: UDP scanning is unreliable without it"
+fi
 
 # ---------------------------------------------------------------- services --
 service_of() {
@@ -279,21 +347,26 @@ probe_for() {
   esac
 }
 
-# version signature match
+# strip control chars/tabs so a banner cannot break the TSV output
+clean() { printf '%s' "$1" | tr -d '\000\r\n' | tr '\t' ' ' | cut -c1-64; }
+
 identify() {
-  local ip=$1 port=$2 b
+  local ip=$1 port=$2 b first srv
   b=$(grab "$ip" "$port" "$(probe_for "$port")" 3)
-  [ -z "$b" ] && { printf ''; return; }
+  [ -z "$b" ] && return 0
+  first=$(printf '%s\n' "$b" | head -1)
   case "$b" in
-    $'\x16\x03'*) printf 'tls/ssl' ;;
-    SSH-*) printf 'ssh %s' "$(printf '%s' "$b" | head -1 | cut -c1-40)" ;;
-    *'220 '*[Ss][Mm][Tt][Pp]*) printf '%s' "$(printf '%s' "$b" | head -1 | cut -c1-48)" ;;
-    *'220 '*FTP*) printf '%s' "$(printf '%s' "$b" | head -1 | cut -c1-48)" ;;
-    *Server:*) printf '%s' "$(printf '%s' "$b" | grep -i '^server:' | head -1 | cut -d' ' -f2- | cut -c1-48)" ;;
-    *'+OK'*) printf '%s' "$(printf '%s' "$b" | head -1 | cut -c1-40)" ;;
-    *'* OK'*) printf 'IMAP %s' "$(printf '%s' "$b" | head -1 | cut -c1-32)" ;;
-    *PONG*) printf 'redis' ;;
-    *) printf '%s' "$(printf '%s' "$b" | tr -d '\000' | head -1 | cut -c1-40)" ;;
+    $'\x16\x03'*)              printf 'tls/ssl' ;;
+    SSH-*)                     printf 'ssh %s' "$(clean "$first")" ;;
+    *'220 '*[Ss][Mm][Tt][Pp]*) printf 'smtp %s' "$(clean "$first")" ;;
+    *'220 '*[Ff][Tt][Pp]*)     printf 'ftp %s' "$(clean "$first")" ;;
+    *Server:*)
+      srv=$(printf '%s\n' "$b" | grep -i '^server:' | head -1 | cut -d' ' -f2-)
+      clean "$srv" ;;
+    *'+OK'*)                   printf 'pop3 %s' "$(clean "$first")" ;;
+    *'* OK'*)                  printf 'imap %s' "$(clean "$first")" ;;
+    *PONG*)                    printf 'redis' ;;
+    *)                         clean "$first" ;;
   esac
 }
 
@@ -301,32 +374,52 @@ identify() {
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/catnmap.XXXXXX")" || die "mktemp failed"
 RES="$WORK/res"; : > "$RES"
 HOSTS="$WORK/hosts"; : > "$HOSTS"
+exec 8>>"$HOSTS"
 exec 9>>"$RES"
-trap 'INTERRUPTED=1' INT
-trap 'rm -rf "$WORK"' EXIT
 
 HAS_FLOCK=0
 command -v flock >/dev/null 2>&1 && HAS_FLOCK=1
 
+lock()   { [ "$HAS_FLOCK" = 1 ] && flock -x "$1"; }
+unlock() { [ "$HAS_FLOCK" = 1 ] && flock -u "$1"; }
+
+trap 'INTERRUPTED=1; kill $(jobs -p) 2>/dev/null' INT
+trap 'rm -rf "$WORK"' EXIT
+
 emit() {
-  if [ "$HAS_FLOCK" = 1 ]; then flock -x 9; fi
+  lock 9
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >&9
-  if [ "$HAS_FLOCK" = 1 ]; then flock -u 9; fi
+  unlock 9
+}
+emit_host() {
+  lock 8
+  printf '%s\t%s\t%s\t%s\n' "$@" >&8
+  unlock 8
 }
 vlog() { [ "$VERBOSE" = 1 ] && printf '%s\n' "$1" >&2; return 0; }
-xml_esc() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
+xml_esc() { printf '%s' "$1" | tr -d '\000\r\n' | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g'; }
 
 # ---------------------------------------------------------------- scanning --
+ping_once() {
+  ping -c1 -W1 "$1" 2>/dev/null && return 0
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" 3 ping -c1 "$1" 2>/dev/null
+  else
+    ping -c1 "$1" 2>/dev/null
+  fi
+}
+
 scan_host() {
-  local ip="$1" ttl os="" up=1 r proto p st ver svc ub
+  local ip="$1" ttl os="" up=1 r proto p st ver svc ub name=""
   if [ "$DO_PING" = 1 ]; then
-    r=$(ping -c1 -W1 "$ip" 2>/dev/null || ping -c1 -w1000 "$ip" 2>/dev/null)
+    r=$(ping_once "$ip")
     if [ -z "$r" ]; then
       up=0
-      # fall back to a probe on a likely port before giving up
-      for p in 80 443 22 445; do [ "$(tcp_state "$ip" "$p" "$CONN_T")" = open ] && { up=1; break; }; done
+      for p in 80 443 22 445; do
+        [ "$(tcp_state "$ip" "$p" "$CONN_T")" = open ] && { up=1; break; }
+      done
     else
-      ttl=$(printf '%s' "$r" | grep -o 'ttl=[0-9]*' | head -1 | cut -d= -f2)
+      ttl=$(printf '%s' "$r" | grep -oiE 'ttl=[0-9]+' | head -1 | cut -d= -f2)
       if [ -n "$ttl" ]; then
         [ "$ttl" -le 64 ] && os="Linux/Unix"
         [ "$ttl" -gt 64 ] && [ "$ttl" -le 128 ] && os="Windows"
@@ -334,23 +427,23 @@ scan_host() {
       fi
     fi
   fi
-  local name=""
+
   if [ "$RESOLVE" = 1 ]; then
     name=$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')
     [ -z "$name" ] && name=$(host "$ip" 2>/dev/null | awk '/domain name pointer/{print $NF; exit}' | sed 's/\.$//')
   fi
 
   if [ "$up" = 0 ]; then
-    printf '%s\tdown\t%s\t%s\n' "$ip" "$name" "$os" >> "$HOSTS"
+    emit_host "$ip" down "$name" "$os"
     vlog "host $ip down"
-    return
+    return 0
   fi
-  printf '%s\tup\t%s\t%s\n' "$ip" "$name" "$os" >> "$HOSTS"
-  [ "$SCAN_TCP" = 0 ] && [ "$SCAN_UDP" = 0 ] && return
+  emit_host "$ip" up "$name" "$os"
+  [ "$SCAN_TCP" = 0 ] && [ "$SCAN_UDP" = 0 ] && return 0
 
   if [ "$SCAN_UDP" = 1 ]; then proto=udp; else proto=tcp; fi
   for p in "${PORTS[@]}"; do
-    [ "$INTERRUPTED" = 1 ] && return
+    [ "$INTERRUPTED" = 1 ] && return 0
     if [ "$SCAN_UDP" = 1 ]; then
       ub=$(udp_grab "$ip" "$p" "$(probe_for "$p")" "$CONN_T")
       if [ -n "$ub" ]; then st="open"; else st="open|filtered"; fi
@@ -372,10 +465,10 @@ throttle() {
   while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$MAX_PAR" ]; do sleep 0.02; done
 }
 
-pct() {  # pct <part> <whole> -> "97%" or "97"
-  [ "$2" -le 0 ] && { printf '0'; return; }
+pct() {
+  [ "$2" -le 0 ] && { printf '0'; return 0; }
   local v=$(( $1 * 100 / $2 ))
-  if [ "$DEGREES" = 1 ]; then printf '%s' "$v"; else printf '%s%%' "$v"; fi
+  if [ "$NO_DEGREES" = 1 ]; then printf '%s' "$v"; else printf '%s%%' "$v"; fi
 }
 
 # ---------------------------------------------------------------- main ------
@@ -385,10 +478,11 @@ printf 'Starting %s %s at %s\n\n' "$PROG" "$VER" "$START_TS" >&2
 ALL_IPS=()
 for t in "${TARGETS[@]}"; do
   while IFS= read -r ip; do
-    case "$ip" in unresolved*) printf '  %s\n' "$ip" >&2 ;; *) ALL_IPS+=("$ip") ;; esac
+    [ -n "$ip" ] && ALL_IPS+=("$ip")
   done < <(expand_one "$t")
 done
 [ "${#ALL_IPS[@]}" -gt 0 ] || die "no targets resolved" 2
+[ "${#ALL_IPS[@]}" -gt 1 ] && ALL_IPS=($(printf '%s\n' "${ALL_IPS[@]}" | awk '!seen[$0]++'))
 
 printf 'Scanning %d host(s), %d port(s), %d worker(s)\n\n' \
   "${#ALL_IPS[@]}" "$NPORTS" "$MAX_PAR" >&2
@@ -403,27 +497,28 @@ wait
 [ "$INTERRUPTED" = 1 ] && printf 'interrupted — reporting partial results\n' >&2
 
 # ---------------------------------------------------------------- render ----
-sort -k1,1 -k2,2n "$RES" 2>/dev/null > "$WORK/res.sorted"
-sort -k1,1 "$HOSTS" 2>/dev/null > "$WORK/hosts.sorted"
+sort -k1,1 -k2,2n "$RES" > "$WORK/res.sorted" 2>/dev/null
+sort -k1,1 "$HOSTS" > "$WORK/hosts.sorted" 2>/dev/null
 
 render_host() {
-  local ip="$1" name="$2" os="$3" state="$4" block nopen closed
+  local ip="$1" name="$2" os="$3" state="$4" block nopen=0 closed
   if [ -n "$name" ]; then echo "Nmap scan report for $name ($ip)"; else echo "Nmap scan report for $ip"; fi
-  if [ "$state" = down ]; then echo "Host is down."; echo; return; fi
+  if [ "$state" = down ]; then echo "Host is down."; echo; return 0; fi
   if [ -n "$os" ]; then echo "Host is up. OS guess: $os"; else echo "Host is up."; fi
+
   block=$(awk -F'\t' -v ip="$ip" '$1==ip' "$WORK/res.sorted")
-  nopen=$(printf '%s\n' "$block" | grep -c 'open')
-  if [ -n "$block" ]; then
-    if [ "$SHOW_ALL" = 1 ] && [ "$NPORTS" -gt 0 ]; then
-      closed=$(( NPORTS - nopen ))
-      [ "$closed" -gt 0 ] && echo "Not shown: $closed closed/filtered port(s) ($(pct "$closed" "$NPORTS"))"
-    fi
-    if [ "$SHOW_ALL" = 1 ] || [ "$nopen" -gt 0 ]; then
-      printf '%-9s %-14s %-14s %s\n' "PORT" "STATE" "SERVICE" "VERSION"
-      printf '%s\n' "$block" | while IFS=$'\t' read -r _ p proto st svc ver; do
-        printf '%-9s %-14s %-14s %s\n' "$p/$proto" "$st" "$svc" "$ver"
-      done
-    fi
+  [ -n "$block" ] && nopen=$(printf '%s\n' "$block" | awk -F'\t' '$4 ~ /^open/{n++} END{print n+0}')
+
+  if [ "$NPORTS" -gt 0 ] && [ "$SHOW_ALL" = 1 ]; then
+    closed=$(( NPORTS - nopen ))
+    [ "$closed" -gt 0 ] && echo "Not shown: $closed closed/filtered port(s) ($(pct "$closed" "$NPORTS"))"
+  fi
+
+  if [ -n "$block" ] && { [ "$SHOW_ALL" = 1 ] || [ "$nopen" -gt 0 ]; }; then
+    printf '%-9s %-14s %-14s %s\n' "PORT" "STATE" "SERVICE" "VERSION"
+    printf '%s\n' "$block" | while IFS=$'\t' read -r _ p proto st svc ver; do
+      printf '%-9s %-14s %-14s %s\n' "$p/$proto" "$st" "$svc" "$ver"
+    done
   fi
   echo
 }
@@ -440,30 +535,41 @@ printf '\n%s %s done at %s\n' "$PROG" "$VER" "$(date '+%Y-%m-%d %H:%M')" >> "$OU
 
 cat "$OUTPUT"
 
-[ -n "$OUT_G" ] && {
-  { for ip in "${ALL_IPS[@]}"; do
+if [ -n "$OUT_G" ]; then
+  {
+    for ip in "${ALL_IPS[@]}"; do
       hn=$(awk -F'\t' -v ip="$ip" '$1==ip{print $3; exit}' "$WORK/hosts.sorted")
       printf 'Host: %s (%s)\t' "$ip" "$hn"
       awk -F'\t' -v ip="$ip" '$1==ip{printf "%s/%s/%s//%s/// ", $2,$4,$3,$5}' "$WORK/res.sorted"
       echo
-    done; } > "$OUT_G"
+    done
+  } > "$OUT_G"
   printf 'grepable output: %s\n' "$OUT_G" >&2
-}
+fi
 
 [ -n "$OUT_N" ] && { cp "$OUTPUT" "$OUT_N"; printf 'normal output: %s\n' "$OUT_N" >&2; }
 
-[ -n "$OUT_X" ] && {
+if [ -n "$OUT_X" ]; then
   {
-    echo '<?xml version="1.0"?>'
-    echo "<nmaprun scanner=\"$PROG\" version=\"$VER\" start=\"$START_TS\">"
+    printf '<?xml version="1.0"?>\n'
+    printf '<nmaprun scanner="%s" version="%s" startstr="%s">\n' \
+      "$(xml_esc "$PROG")" "$VER" "$(xml_esc "$START_TS")"
     for ip in "${ALL_IPS[@]}"; do
-      echo "  <host><address addr=\"$ip\" addrtype=\"ipv4\"/><ports>"
-      awk -F'\t' -v ip="$ip" '$1==ip{printf "    <port protocol=\"%s\" portid=\"%s\"><state state=\"%s\"/><service name=\"%s\" version=\"%s\"/></port>\n", $3,$2,$4,$5,$6}' "$WORK/res.sorted"
-      echo "  </ports></host>"
+      hstate=$(awk -F'\t' -v ip="$ip" '$1==ip{print $2; exit}' "$WORK/hosts.sorted")
+      hn=$(awk -F'\t' -v ip="$ip" '$1==ip{print $3; exit}' "$WORK/hosts.sorted")
+      printf '  <host><status state="%s"/><address addr="%s" addrtype="ipv4"/>' "$hstate" "$ip"
+      [ -n "$hn" ] && printf '<hostnames><hostname name="%s"/></hostnames>' "$(xml_esc "$hn")"
+      printf '<ports>\n'
+      while IFS=$'\t' read -r _ p proto pstate svc ver; do
+        [ -z "$p" ] && continue
+        printf '    <port protocol="%s" portid="%s"><state state="%s"/><service name="%s" version="%s"/></port>\n' \
+          "$proto" "$p" "$pstate" "$(xml_esc "$svc")" "$(xml_esc "$ver")"
+      done <<< "$(awk -F'\t' -v ip="$ip" '$1==ip' "$WORK/res.sorted")"
+      printf '  </ports></host>\n'
     done
-    echo '</nmaprun>'
+    printf '</nmaprun>\n'
   } > "$OUT_X"
   printf 'xml output: %s\n' "$OUT_X" >&2
-}
+fi
 
 exit 0
